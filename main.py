@@ -6,7 +6,7 @@ from folium.plugins import AntPath, BeautifyIcon
 
 from utils.coord_transform import bd09_to_wgs84
 
-
+# TODO: 输入req可能没有depot
 def create_visualization(data_file="data/req.json", output_file="input_map.html"):
     """
     创建物流可视化地图
@@ -137,9 +137,20 @@ def create_output_visualization(
     assigned_route_group = folium.FeatureGroup(
         name="已指派路线 (Assigned Route)"
     ).add_to(m)
-    unassigned_group = folium.FeatureGroup(
-        name="未指派站点 (Unassigned Stations)"
-    ).add_to(m)
+    
+    # 创建按未指派原因分组的图层组
+    unassigned_groups = {}
+    reason_colors = {
+        "为优化总成本而被放弃 (惩罚项生效)": "#dc3545",  # 红色 - 成本优化放弃
+        "预剪枝: 需求为零的站点": "#fd7e14",  # 橙色 - 需求为零
+        "预剪枝: 未启用储车区": "#6f42c1",  # 紫色 - 未启用储车区
+        "other": "#6c757d"  # 灰色 - 其他原因
+    }
+    
+    # 为每种原因创建图层组
+    for reason, color in reason_colors.items():
+        group_name = f"未指派站点 - {reason}"
+        unassigned_groups[reason] = folium.FeatureGroup(name=group_name).add_to(m)
 
     # 仓库
     folium.Marker(
@@ -198,6 +209,12 @@ def create_output_visualization(
                     if station["demands"] >= 0
                     else str(station["demands"])
                 )
+                serviced_demand = stop.get("demand", 0) 
+                new_demand_text = (
+                    f"+{serviced_demand}"
+                    if serviced_demand >= 0
+                    else str(serviced_demand)
+                )
                 demand_color = "#5cb85c" if station["demands"] >= 0 else "#f0ad4e"
 
                 # 2. 【核心修改】使用 BeautifyIcon 将数字和标记合并
@@ -220,6 +237,7 @@ def create_output_visualization(
                             <p><strong>名称:</strong> {station['station_name']}</p>
                             <p><strong>ID:</strong> {station['station_id']}</p>
                             <p><strong style="color: {demand_color};">需求:</strong> {demand_text} 箱</p>
+                            <p><strong style="color: {demand_color};">新需求:</strong> {new_demand_text} 箱</p>
                             <hr>
                             <h4 style="color: #0275d8; margin: 10px 0 5px 0;">任务信息</h4>
                             <p><strong>到达时间:</strong> {stop['arrival_time']}</p>
@@ -248,7 +266,7 @@ def create_output_visualization(
             popup="动态行驶路线",
         ).add_to(assigned_route_group)
 
-    # 绘制未指派站点（灰色）
+    # 绘制未指派站点（按原因分组）
     for unassigned in response_data["data"]["unassigned_tasks"]:
         location_id = unassigned["location_id"]
         if location_id in station_id_map:
@@ -260,6 +278,12 @@ def create_output_visualization(
                 if station["demands"] >= 0
                 else str(station["demands"])
             )
+            
+            # 确定原因和对应的颜色
+            reason = unassigned.get('reason', 'other')
+            if reason not in reason_colors:
+                reason = 'other'
+            color = reason_colors[reason]
 
             folium.CircleMarker(
                 st_wgs,
@@ -267,21 +291,21 @@ def create_output_visualization(
                 popup=folium.Popup(
                     f"""
                     <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                        <h3 style="color: #6c757d; margin: 0 0 10px 0;">未指派站点</h3>
+                        <h3 style="color: {color}; margin: 0 0 10px 0;">未指派站点</h3>
                         <p><strong>名称:</strong> {station['station_name']}</p>
                         <p><strong>ID:</strong> {station['station_id']}</p>
-                        <p><strong style="color: #6c757d;">需求:</strong> {demand_text} 箱</p>
+                        <p><strong style="color: {color};">需求:</strong> {demand_text} 箱</p>
                         <hr>
-                        <h4 style="color: #dc3545; margin: 10px 0 5px 0;">未指派原因</h4>
+                        <h4 style="color: {color}; margin: 10px 0 5px 0;">未指派原因</h4>
                         <p>{unassigned['reason']}</p>
                     </div>
                     """,
                     max_width=300,
                 ),
-                color="#6c757d",
+                color=color,
                 fill=True,
-                fill_opacity=0.5,
-            ).add_to(unassigned_group)
+                fill_opacity=0.7,
+            ).add_to(unassigned_groups[reason])
 
     # 添加图层控制器
     folium.LayerControl().add_to(m)
