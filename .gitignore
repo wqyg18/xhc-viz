@@ -10,3 +10,8 @@ wheels/
 .venv
 *.html
 data/
+test_input/
+test_output/
+*.json
+*.ipynb
+*.csv
