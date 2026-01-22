@@ -15,3 +15,8 @@ test_output/
 *.json
 *.ipynb
 *.csv
+*.txt
+*.log
+*.zip
+*.tar
+*.tar.gz

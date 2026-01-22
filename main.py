@@ -1,110 +1,181 @@
 import json
 
 import folium
-from folium.features import DivIcon
-from folium.plugins import AntPath, BeautifyIcon
+from folium.plugins import AntPath, BeautifyIcon, Fullscreen
 
 from utils.coord_transform import bd09_to_wgs84
 
-# TODO: 输入req可能没有depot
+COLOR_PICKUP = "#52c41a"  # 绿色
+COLOR_DELIVERY = "#fa8c16"  # 橙色
+COLOR_DEPOT = "#d9534f"  # 红色
+COLOR_VEHICLE = "#0275d8"  # 蓝色
+
+
+class MapTemplate:
+    """管理所有地图弹窗的 HTML/CSS 模板"""
+
+    @staticmethod
+    def get_base_style():
+        return """
+        <style>
+            .map-popup { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; min-width: 240px; color: #333; padding: 5px; }
+            .map-header { border-bottom: 2px solid #f0f0f0; margin-bottom: 10px; padding-bottom: 5px; }
+            .map-header h3 { margin: 0; font-size: 16px; font-weight: 600; display: flex; align-items: center; }
+            .info-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; border-bottom: 1px solid #fafafa; }
+            .info-label { color: #666; font-weight: 500; }
+            .info-value { color: #111; font-weight: 600; text-align: right; }
+            .divider { margin: 10px 0; border-top: 1px dashed #eee; }
+            .status-tag { padding: 2px 8px; border-radius: 10px; font-size: 11px; color: white; background: #888; }
+            .reason-box { background: #fff1f0; border: 1px solid #ffa39e; padding: 8px; border-radius: 4px; margin-top: 8px; font-size: 12px; color: #cf1322; }
+        </style>
+        """
+
+    @classmethod
+    def render_depot(cls, depot):
+        return f"""
+        {cls.get_base_style()}
+        <div class="map-popup">
+            <div class="map-header"><h3 style="color: #d9534f;">🏠 仓库信息</h3></div>
+            <div class="info-row"><span class="info-label">名称:</span><span class="info-value">{depot['station_name']}</span></div>
+            <div class="info-row"><span class="info-label">ID:</span><span class="info-value">{depot['station_id']}</span></div>
+            <div class="info-row"><span class="info-label">区域:</span><span class="info-value">{depot.get('area', 'N/A')}</span></div>
+            <div class="info-row"><span class="info-label">详细地址:</span><span class="info-value">{depot.get('location', 'N/A')}</span></div>
+        </div>
+        """
+
+    @classmethod
+    def render_vehicle(cls, v):
+        return f"""
+        {cls.get_base_style()}
+        <div class="map-popup">
+            <div class="map-header"><h3 style="color: #0275d8;">🚚 车辆信息</h3></div>
+            <div class="info-row"><span class="info-label">车牌:</span><span class="info-value">{v['vehicle_id']}</span></div>
+            <div class="info-row"><span class="info-label">类型:</span><span class="info-value">{v['vehicle_type']}</span></div>
+            <div class="info-row"><span class="info-label">载重能力:</span><span class="info-value">{v['current_load']} / {v['capacity']} 箱</span></div>
+            <div class="info-row"><span class="info-label">工作时间:</span><span class="info-value">{v['work_hours']['start']} - {v['work_hours']['end']}</span></div>
+            <div class="divider"></div>
+            <div class="info-row"><span class="info-label">运行状态:</span><span class="status-tag" style="background:#0275d8">{v['vehicle_status']}</span></div>
+        </div>
+        """
+
+    @classmethod
+    def render_station(
+        cls, st, stop_info=None, unassigned_reason=None, new_demand=None
+    ):
+        """通用站点模板：支持基础地图、已指派路径图、未指派图"""
+        d_val = st.get("demands", 0)
+        d_color = "#52c41a" if d_val >= 0 else "#fa8c16"
+        icon = "📈" if d_val >= 0 else "📉"
+
+        # 基础 HTML 结构
+        html = f"""
+        {cls.get_base_style()}
+        <div class="map-popup">
+            <div class="map-header"><h3 style="color: {d_color};">{icon} {st.get('station_name', '未知站点')}</h3></div>
+            <div class="info-row"><span class="info-label">ID:</span><span class="info-value">{st.get('station_id', 'N/A')}</span></div>
+            <div class="info-row"><span class="info-label">详细地址:</span><span class="info-value">{st.get('location', st.get('address', 'N/A'))}</span></div>
+            <div class="info-row"><span class="info-label">区域:</span><span class="info-value">{st.get('area', 'N/A')}</span></div>
+            <div class="info-row"><span class="info-label">需求量:</span><span class="info-value" style="color:{d_color}">{d_val:+} 箱</span></div>
+        """
+
+        # --- 新增：如果传了 new_demand，就显示出来 ---
+        if new_demand is not None:
+            nd_text = f"{new_demand:+}" if new_demand >= 0 else str(new_demand)
+            html += f"""<div class="info-row"><span class="info-label" style="color:#096dd9;">新需求:</span><span class="info-value" style="color:#096dd9; font-weight:bold;">{nd_text} 箱</span></div>"""
+        # ----------------------------------------
+
+        html += f"""
+            <div class="info-row"><span class="info-label">锁柜(空闲/总数):</span><span class="info-value">{st.get('available_nums', 0)}/{st.get('locker_nums', 0)}</span></div>
+            <div class="info-row"><span class="info-label">服务耗时:</span><span class="info-value">{st.get('service_time', 0)} min</span></div>
+            <div class="info-row"><span class="info-label">优先级:</span><span class="info-value">{st.get('priority', 0)}</span></div>
+            <div class="info-row"><span class="info-label">需求时间:</span><span class="info-value" style="font-size:11px;">{st.get('demand_time', 'N/A')}</span></div>
+            <div class="info-row"><span class="info-label">原始坐标:</span><span class="info-value">{st.get('longitude')}, {st.get('latitude')}</span></div>
+        """
+
+        if stop_info:
+            html += f"""
+            <div class="divider"></div>
+            <div class="info-row" style="color:#096dd9;"><span class="info-label">配送顺序:</span><span class="info-value">第 {stop_info['index']} 站</span></div>
+            <div class="info-row"><span class="info-label">预计到达:</span><span class="info-value">{stop_info['arrival_time']}</span></div>
+            <div class="info-row"><span class="info-label">服务后负载:</span><span class="info-value">{stop_info['load_after_service']} 箱</span></div>
+            """
+
+        if unassigned_reason:
+            html += f"""<div class="reason-box"><strong>未指派原因:</strong><br>{unassigned_reason}</div>"""
+
+        html += "</div>"
+        return html
+
+
 def create_visualization(data_file="data/req.json", output_file="input_map.html"):
     """
-    创建物流可视化地图
-
-    Args:
-        data_file: 输入数据文件路径
-        output_file: 输出HTML文件路径
+    [升级版] 创建基础物流分布图
+    风格已与 create_output_visualization 统一，使用 BeautifyIcon 和 图层控制
     """
-    # ===== 读取 JSON 文件 =====
     with open(data_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 中心点用仓库
+    # 1. 地图初始化
     depot_wgs = bd09_to_wgs84(data["depot"]["longitude"], data["depot"]["latitude"])
     m = folium.Map(location=depot_wgs, zoom_start=14, tiles="CartoDB positron")
+    Fullscreen().add_to(m)
 
-    # 仓库
+    # 2. 定义图层 (FeatureGroup) - 模仿第二个函数的图层管理
+    layer_base = folium.FeatureGroup(name="🏢 基础设置 (仓库/车辆)", show=True)
+    layer_pickup = folium.FeatureGroup(name="🟩 取货需求点 (Pickup)", show=True)
+    layer_delivery = folium.FeatureGroup(name="🟧 送货需求点 (Delivery)", show=True)
+
+    # 将图层添加到地图
+    layer_base.add_to(m)
+    layer_pickup.add_to(m)
+    layer_delivery.add_to(m)
+
+    # 3. 绘制仓库 (加入基础图层)
     folium.Marker(
         depot_wgs,
-        popup=folium.Popup(
-            f"""
-            <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                <h3 style="color: #d9534f; margin: 0 0 10px 0;">仓库信息</h3>
-                <p><strong>名称:</strong> {data['depot']['station_name']}</p>
-                <p><strong>ID:</strong> {data['depot']['station_id']}</p>
-                <p><strong>地址:</strong> {data['depot']['location']}</p>
-                <p><strong>区域:</strong> {data['depot']['area']}</p>
-                <p><strong>坐标:</strong> {data['depot']['longitude']:.6f}, {data['depot']['latitude']:.6f}</p>
-            </div>
-            """,
-            max_width=300,
-        ),
+        popup=folium.Popup(MapTemplate.render_depot(data["depot"]), max_width=350),
         icon=folium.Icon(color="red", icon="home", prefix="fa"),
-    ).add_to(m)
+    ).add_to(layer_base)
 
-    # 车辆
+    # 4. 绘制车辆 (加入基础图层)
     vehicle_wgs = bd09_to_wgs84(
         data["vehicle"]["longitude"], data["vehicle"]["latitude"]
     )
     folium.Marker(
         vehicle_wgs,
-        popup=folium.Popup(
-            f"""
-            <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                <h3 style="color: #0275d8; margin: 0 0 10px 0;">车辆信息</h3>
-                <p><strong>车牌:</strong> {data['vehicle']['vehicle_id']}</p>
-                <p><strong>当前位置:</strong> {data['vehicle']['location']}</p>
-                <p><strong>区域:</strong> {data['vehicle']['current_area']}</p>
-                <p><strong>类型:</strong> {data['vehicle']['vehicle_type']}</p>
-                <p><strong>容量:</strong> {data['vehicle']['capacity']} 箱</p>
-                <p><strong>当前负载:</strong> {data['vehicle']['current_load']} 箱</p>
-                <p><strong>状态:</strong> {data['vehicle']['vehicle_status']}</p>
-                <p><strong>今日剩余任务:</strong> {data['vehicle']['remaining_tasks_today']}</p>
-                <p><strong>工作时间:</strong> {data['vehicle']['work_hours']['start']} - {data['vehicle']['work_hours']['end']}</p>
-            </div>
-            """,
-            max_width=300,
-        ),
+        popup=folium.Popup(MapTemplate.render_vehicle(data["vehicle"]), max_width=350),
         icon=folium.Icon(color="blue", icon="truck", prefix="fa"),
-    ).add_to(m)
+    ).add_to(layer_base)
 
-    # 各个站点
+    # 5. 绘制站点 - 使用 BeautifyIcon 替代 CircleMarker
     for st in data["stations"]:
         st_wgs = bd09_to_wgs84(st["longitude"], st["latitude"])
+        popup_content = MapTemplate.render_station(st)
 
-        # 格式化需求信息
-        demand_text = f"+{st['demands']}" if st["demands"] >= 0 else str(st["demands"])
-        demand_color = "#5cb85c" if st["demands"] >= 0 else "#f0ad4e"
+        # 判断类型
+        is_pickup = st["demands"] >= 0
+        color = COLOR_PICKUP if is_pickup else COLOR_DELIVERY
+        target_layer = layer_pickup if is_pickup else layer_delivery
 
-        folium.CircleMarker(
-            st_wgs,
-            radius=6,
-            popup=folium.Popup(
-                f"""
-                <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                    <h3 style="color: {demand_color}; margin: 0 0 10px 0;">站点信息</h3>
-                    <p><strong>名称:</strong> {st['station_name']}</p>
-                    <p><strong>ID:</strong> {st['station_id']}</p>
-                    <p><strong>地址:</strong> {st['location'] if st['location'] else '未知'}</p>
-                    <p><strong>区域:</strong> {st['area']}</p>
-                    <p><strong style="color: {demand_color};">需求:</strong> {demand_text} 箱</p>
-                    <p><strong>锁柜总数:</strong> {st['locker_nums']}</p>
-                    <p><strong>可用锁柜:</strong> {st['available_nums']}</p>
-                    <p><strong>服务时间:</strong> {st['service_time']} 分钟</p>
-                    <p><strong>优先级:</strong> {st['priority']}</p>
-                    <p><strong>需求时间:</strong> {st['demand_time']}</p>
-                    <p><strong>坐标:</strong> {st['longitude']:.6f}, {st['latitude']:.6f}</p>
-                </div>
-                """,
-                max_width=300,
-            ),
-            color="green" if st["demands"] >= 0 else "orange",
-            fill=True,
-            fill_opacity=0.7,
-        ).add_to(m)
+        # 使用与 output_map 相同风格的图标，但 icon 改为 'cube' 表示货物
+        icon = BeautifyIcon(
+            icon="cube",  # 盒子图标，表示这是一个任务点
+            icon_shape="circle",  # 圆形底座
+            background_color=color,
+            text_color="white",
+            border_color="white",
+            prefix="fa",  # FontAwesome
+        )
 
-    # 保存地图
+        folium.Marker(
+            location=st_wgs, popup=folium.Popup(popup_content, max_width=350), icon=icon
+        ).add_to(target_layer)
+
+    # 6. 添加图层控制器
+    folium.LayerControl(collapsed=False).add_to(m)
+
     m.save(output_file)
+    print(f"✅ 基础分布地图已生成 (样式已统一): {output_file}")
 
 
 def create_output_visualization(
@@ -112,235 +183,114 @@ def create_output_visualization(
     response_file="data/response.json",
     output_file="output_map.html",
 ):
-    """
-    创建美化且动态的输出结果可视化地图（已修正点击问题）
-
-    Args:
-        req_file: 请求数据文件路径
-        response_file: 响应数据文件路径
-        output_file: 输出HTML文件路径
-    """
-    # ===== 读取 JSON 文件 =====
     with open(req_file, "r", encoding="utf-8") as f:
         req_data = json.load(f)
-
     with open(response_file, "r", encoding="utf-8") as f:
         response_data = json.load(f)
 
-    # 中心点用仓库
+    # 地图初始化
     depot_wgs = bd09_to_wgs84(
         req_data["depot"]["longitude"], req_data["depot"]["latitude"]
     )
     m = folium.Map(location=depot_wgs, zoom_start=14, tiles="CartoDB positron")
+    Fullscreen().add_to(m)
 
-    # ===== 创建图层组，用于图层控制 =====
-    assigned_route_group = folium.FeatureGroup(
-        name="已指派路线 (Assigned Route)"
-    ).add_to(m)
-    
-    # 创建按未指派原因分组的图层组
-    unassigned_groups = {}
+    # 图层定义
+    assigned_group = folium.FeatureGroup(name="✅ 已指派路线").add_to(m)
     reason_colors = {
-        "为优化总成本而被放弃 (惩罚项生效)": "#dc3545",  # 红色 - 成本优化放弃
-        "预剪枝: 需求为零的站点": "#fd7e14",  # 橙色 - 需求为零
-        "预剪枝: 未启用储车区": "#6f42c1",  # 紫色 - 未启用储车区
-        "other": "#6c757d"  # 灰色 - 其他原因
+        "为优化总成本而被放弃 (惩罚项生效)": "#dc3545",
+        "预剪枝: 需求为零的站点": "#fd7e14",
+        "预剪枝: 未启用储车区": "#6f42c1",
+        "other": "#6c757d",
     }
-    
-    # 为每种原因创建图层组
-    for reason, color in reason_colors.items():
-        group_name = f"未指派站点 - {reason}"
-        unassigned_groups[reason] = folium.FeatureGroup(name=group_name).add_to(m)
+    unassigned_layers = {
+        r: folium.FeatureGroup(name=f"❌ 未指派 - {r}").add_to(m) for r in reason_colors
+    }
 
-    # 仓库
-    folium.Marker(
-        depot_wgs,
-        popup=folium.Popup(
-            f"""
-            <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                <h3 style="color: #d9534f; margin: 0 0 10px 0;">仓库信息</h3>
-                <p><strong>名称:</strong> {req_data['depot']['station_name']}</p>
-                <p><strong>ID:</strong> {req_data['depot']['station_id']}</p>
-                <p><strong>地址:</strong> {req_data['depot']['location']}</p>
-            </div>
-            """,
-            max_width=300,
-        ),
-        icon=folium.Icon(color="red", icon="home", prefix="fa"),
-    ).add_to(m)
-
-    # 车辆
+    # 2. 绘制车辆起步点
     vehicle_wgs = bd09_to_wgs84(
         req_data["vehicle"]["longitude"], req_data["vehicle"]["latitude"]
     )
     folium.Marker(
         vehicle_wgs,
         popup=folium.Popup(
-            f"""
-            <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                <h3 style="color: #0275d8; margin: 0 0 10px 0;">车辆信息</h3>
-                <p><strong>车牌:</strong> {req_data['vehicle']['vehicle_id']}</p>
-                <p><strong>当前位置:</strong> {req_data['vehicle']['location']}</p>
-            </div>
-            """,
-            max_width=300,
+            MapTemplate.render_vehicle(req_data["vehicle"]), max_width=350
         ),
         icon=folium.Icon(color="blue", icon="truck", prefix="fa"),
-    ).add_to(assigned_route_group)
+    ).add_to(assigned_group)
 
-    # 创建站点ID映射
-    station_id_map = {}
-    for station in req_data["stations"]:
-        station_id_map[station["station_id"]] = station
+    # 3. 准备数据映射
+    station_map = {s["station_id"]: s for s in req_data["stations"]}
+    route_coords = [vehicle_wgs]
 
-    # 绘制已指派站点的路线
-    route_coordinates = [vehicle_wgs]
-    stop_counter = 1
+    # 4. 绘制已指派站点
+    stop_idx = 1
     for route in response_data["data"]["routes"]:
         for stop in route["stops"]:
-            location_id = stop["location_id"]
-            if location_id in station_id_map:
-                station = station_id_map[location_id]
-                st_wgs = bd09_to_wgs84(station["longitude"], station["latitude"])
-                route_coordinates.append(st_wgs)
+            sid = stop["location_id"]
+            if sid in station_map:
+                st = station_map[sid]
+                st_wgs = bd09_to_wgs84(st["longitude"], st["latitude"])
+                route_coords.append(st_wgs)
 
-                demand_text = (
-                    f"+{station['demands']}"
-                    if station["demands"] >= 0
-                    else str(station["demands"])
-                )
-                serviced_demand = stop.get("demand", 0) 
-                new_demand_text = (
-                    f"+{serviced_demand}"
-                    if serviced_demand >= 0
-                    else str(serviced_demand)
-                )
-                demand_color = "#5cb85c" if station["demands"] >= 0 else "#f0ad4e"
-
-                # 2. 【核心修改】使用 BeautifyIcon 将数字和标记合并
-                icon = BeautifyIcon(
-                    icon_shape="circle",
-                    number=stop_counter,
-                    spin=False,
-                    border_color=demand_color,
-                    background_color=demand_color,
-                    text_color="#FFFFFF",
-                    inner_icon_style="font-size:12px;padding-top:2px;",
+                # 使用模板渲染 Popup
+                popup_content = MapTemplate.render_station(
+                    st,
+                    stop_info={
+                        "index": stop_idx,
+                        "arrival_time": stop["arrival_time"],
+                        "load_after_service": stop["load_after_service"],
+                    },
+                    new_demand=stop.get("demand", 0),
                 )
 
+                # 绘制 Marker
                 folium.Marker(
                     location=st_wgs,
-                    popup=folium.Popup(
-                        f"""
-                        <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                            <h3 style="color: {demand_color}; margin: 0 0 10px 0;">站点信息 (顺序: {stop_counter})</h3>
-                            <p><strong>名称:</strong> {station['station_name']}</p>
-                            <p><strong>ID:</strong> {station['station_id']}</p>
-                            <p><strong style="color: {demand_color};">需求:</strong> {demand_text} 箱</p>
-                            <p><strong style="color: {demand_color};">新需求:</strong> {new_demand_text} 箱</p>
-                            <hr>
-                            <h4 style="color: #0275d8; margin: 10px 0 5px 0;">任务信息</h4>
-                            <p><strong>到达时间:</strong> {stop['arrival_time']}</p>
-                            <p><strong>服务开始:</strong> {stop['service_start_time']}</p>
-                            <p><strong>完成时间:</strong> {stop['finish_time']}</p>
-                            <p><strong>服务后负载:</strong> {stop['load_after_service']}</p>
-                        </div>
-                        """,
-                        max_width=300,
+                    popup=folium.Popup(popup_content, max_width=350),
+                    icon=BeautifyIcon(
+                        icon_shape="circle",
+                        number=stop_idx,
+                        background_color="#52c41a" if st["demands"] >= 0 else "#fa8c16",
+                        text_color="white",
+                        border_color="white",
                     ),
-                    icon=icon,
-                ).add_to(assigned_route_group)
+                ).add_to(assigned_group)
+                stop_idx += 1
 
-                stop_counter += 1
+    # 5. 绘制动态路径
+    if len(route_coords) > 1:
+        AntPath(locations=route_coords, delay=1000, color="#007bff", weight=5).add_to(
+            assigned_group
+        )
 
-    # 添加动态线路 AntPath
-    if len(route_coordinates) > 1:
-        AntPath(
-            locations=route_coordinates,
-            delay=800,
-            dash_array=[10, 20],
-            color="#007bff",
-            pulse_color="#FFFFFF",
-            weight=5,
-            opacity=0.8,
-            popup="动态行驶路线",
-        ).add_to(assigned_route_group)
+    # 6. 绘制未指派站点
+    for un in response_data["data"]["unassigned_tasks"]:
+        sid = un["location_id"]
+        if sid in station_map:
+            st = station_map[sid]
+            st_wgs = bd09_to_wgs84(st["longitude"], st["latitude"])
+            reason = un.get("reason", "other")
+            target_group = unassigned_layers.get(reason, unassigned_layers["other"])
 
-    # 绘制未指派站点（按原因分组）
-    for unassigned in response_data["data"]["unassigned_tasks"]:
-        location_id = unassigned["location_id"]
-        if location_id in station_id_map:
-            station = station_id_map[location_id]
-            st_wgs = bd09_to_wgs84(station["longitude"], station["latitude"])
-
-            demand_text = (
-                f"+{station['demands']}"
-                if station["demands"] >= 0
-                else str(station["demands"])
+            popup_content = MapTemplate.render_station(
+                st, unassigned_reason=un["reason"]
             )
-            
-            # 确定原因和对应的颜色
-            reason = unassigned.get('reason', 'other')
-            if reason not in reason_colors:
-                reason = 'other'
-            color = reason_colors[reason]
 
             folium.CircleMarker(
-                st_wgs,
-                radius=6,
-                popup=folium.Popup(
-                    f"""
-                    <div style="font-family: Arial, sans-serif; max-width: 300px;">
-                        <h3 style="color: {color}; margin: 0 0 10px 0;">未指派站点</h3>
-                        <p><strong>名称:</strong> {station['station_name']}</p>
-                        <p><strong>ID:</strong> {station['station_id']}</p>
-                        <p><strong style="color: {color};">需求:</strong> {demand_text} 箱</p>
-                        <hr>
-                        <h4 style="color: {color}; margin: 10px 0 5px 0;">未指派原因</h4>
-                        <p>{unassigned['reason']}</p>
-                    </div>
-                    """,
-                    max_width=300,
-                ),
-                color=color,
+                location=st_wgs,
+                radius=7,
                 fill=True,
-                fill_opacity=0.7,
-            ).add_to(unassigned_groups[reason])
+                color=reason_colors.get(reason, "#6c757d"),
+                popup=folium.Popup(popup_content, max_width=350),
+            ).add_to(target_group)
 
-    # 添加图层控制器
-    folium.LayerControl().add_to(m)
-
-    # 保存地图
+    folium.LayerControl(collapsed=False).add_to(m)
     m.save(output_file)
+    print(f"✨ 可视化地图已生成: {output_file}")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="物流可视化工具")
-    parser.add_argument(
-        "--data_file",
-        nargs="?",
-        default="data/req.json",
-        help="输入数据文件路径 (默认: data/req.json)",
-    )
-
-    args = parser.parse_args()
-
-    input_map_file = f"input_map.html"
-    output_map_file = f"output_map.html"
-
-    # 自动生成响应文件名（基于输入文件名）
-    response_file = "data/response.json"
-
-    print(f"输入文件: {args.data_file}")
-    print(f"响应文件: {response_file}")
-    print(f"站点地图: {input_map_file}")
-    print(f"路线地图: {output_map_file}")
-
-    create_visualization(data_file=args.data_file, output_file=input_map_file)
-    create_output_visualization(
-        req_file=args.data_file,
-        response_file=response_file,
-        output_file=output_map_file,
-    )
+    # 假设 data/ 目录下已有相关文件
+    create_visualization()
+    create_output_visualization()
