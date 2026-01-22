@@ -177,39 +177,6 @@ python request_and_visualize.py visualize-compare --input-dir mylog_input/app_YY
 # - 可视化结果: visualization/original/ 或 visualization/compare/
 ```
 
-## 🎯 工作流程总结
-
-```mermaid
-graph LR
-    A[单次测试] --> B[data/]
-    B --> C[main.py]
-    C --> D[根目录HTML文件]
-
-    E[批量测试] --> F[test_input/]
-    F --> G[batch_test.py]
-    G --> H[test_output/]
-
-    I[日志可视化] --> J[from_logs/*.txt]
-    J --> K[viz_from_logs.py]
-    K --> L[from_logs/{hash}/]
-
-    M[批量可视化] --> N[4c1396ccc039445ea171519d811d85cc/]
-    N --> O[batch_viz.py]
-    O --> P[4c1396ccc039445ea171519d811d85cc/html/]
-
-    Q[算法日志处理] --> R[mylog_input/app_YYYY-MM-DD.log]
-    R --> S[rid_log_matcher.py]
-    S --> T[mylog_input/app_YYYY-MM-DD/]
-
-    T --> U[request_and_visualize.py request]
-    U --> V[new_responses/]
-    T --> W[request_and_visualize.py visualize-original]
-    T --> X[request_and_visualize.py visualize-compare]
-    V --> X
-    W --> Y[visualization/original/]
-    X --> Z[visualization/compare/]
-```
-
 ## 📋 Makefile命令说明
 
 | 命令 | 🎯 功能 | 📂 涉及文件夹 |
