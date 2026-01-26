@@ -56,18 +56,24 @@ def find_key_recursive(data, key):
     return None
 
 def extract_logs():
-    pending_requests = {}
+    pending_requests = {} # rid -> {"content": str, "v_id": str, "d_type": int, "p_type": int}
     stats = {
         "total_req_found": 0,
         "success_pairs": 0,        
         "ignored_by_filter": 0,    
-        "failed_json": 0
+        "failed_json": 0,
+        "empty_routes": 0,
+        "algorithm_error": 0
     }
     combination_counts = defaultdict(int)
     vehicle_stats = defaultdict(lambda: {
-        "total_req_found": 0,
-        "success_pairs": 0,
-        "ignored_by_filter": 0,
+        "total_req": 0,
+        "target_req": 0,
+        "normal": 0,
+        "empty": 0,
+        "error": 0,
+        "unmatched": 0,
+        "filtered": 0,
         "failed_json": 0
     })
 
@@ -76,18 +82,32 @@ def extract_logs():
             # 1. 匹配请求行
             req_match = re.search(req_pattern, line)
             if req_match:
-                rid, req_json = req_match.groups()
-                pending_requests[rid] = req_json.strip()
-                # 从请求中提取vehicle_id用于统计
-                try:
-                    req_data = json.loads(req_json.strip())
-                    req_vehicle_id = find_key_recursive(req_data, "vehicle_id")
-                    if req_vehicle_id is None:
-                        req_vehicle_id = "unknown"
-                    vehicle_stats[req_vehicle_id]["total_req_found"] += 1
-                except json.JSONDecodeError:
-                    pass  # 如果请求JSON解析失败，不影响后续处理
-                stats["total_req_found"] += 1
+                req_id_match = re.search(r"rid=([a-f0-9\-]+)", line)
+                if req_id_match:
+                    rid = req_id_match.group(1)
+                    req_content = line.split("接收到调度请求详情", 1)[1].strip()
+                    if req_content.startswith(":") or req_content.startswith("："):
+                        req_content = req_content[1:].strip()
+                    
+                    v_id = "unknown"
+                    d_type = None
+                    p_type = None
+                    try:
+                        req_data = json.loads(req_content)
+                        v_id = find_key_recursive(req_data, "vehicle_id") or "unknown"
+                        d_type = find_key_recursive(req_data, "decision_type")
+                        p_type = find_key_recursive(req_data, "plan_type")
+                    except:
+                        pass
+                    
+                    pending_requests[rid] = {
+                        "content": req_content,
+                        "v_id": v_id,
+                        "d_type": d_type,
+                        "p_type": p_type
+                    }
+                    vehicle_stats[v_id]["total_req"] += 1
+                    stats["total_req_found"] += 1
                 continue
 
             # 2. 匹配响应行
@@ -96,104 +116,119 @@ def extract_logs():
                 rid, rsp_json_str = rsp_match.groups()
 
                 if rid in pending_requests:
-                    req_json_str = pending_requests[rid]
+                    req_info = pending_requests[rid]
+                    v_id = req_info["v_id"]
+                    d_type = req_info["d_type"]
+                    p_type = req_info["p_type"]
+                    
+                    combination_counts[(d_type, p_type)] += 1
+                    
                     try:
-                        # 解析请求 JSON 以获取 vehicle_id
-                        req_data = json.loads(req_json_str)
-                        vehicle_id = find_key_recursive(req_data, "vehicle_id")
-                        
-                        # 确保 vehicle_id 有值，否则使用默认值
-                        if vehicle_id is None:
-                            vehicle_id = "unknown"
-                        
-                        # 解析响应 JSON
+                        req_data = json.loads(req_info["content"])
                         rsp_data = json.loads(rsp_json_str.strip())
                         
-                        # 使用递归函数提取字段，解决层级问题
-                        d_type = find_key_recursive(req_data, "decision_type")
-                        p_type = find_key_recursive(req_data, "plan_type")
-                        
-                        # 记录组合 (处理 None 的情况)
-                        key_tuple = (d_type, p_type)
-                        combination_counts[key_tuple] += 1
-                        
-                        # 过滤逻辑
+                        # 过滤逻辑 (1,0)
                         if d_type == 1 and p_type == 0:
-                            save_to_file(rid, req_data, "req", vehicle_id)
-                            save_to_file(rid, rsp_data, "rsp", vehicle_id)
-                            stats["success_pairs"] += 1
-                            vehicle_stats[vehicle_id]["success_pairs"] += 1
+                            vehicle_stats[v_id]["target_req"] += 1
+                            # 判断健康度
+                            if rsp_data.get("status") != "Success":
+                                status_label = "error"
+                                stats["algorithm_error"] += 1
+                                vehicle_stats[v_id]["error"] += 1
+                            else:
+                                routes = rsp_data.get("data", {}).get("routes", []) if "data" in rsp_data else rsp_data.get("routes", [])
+                                if not routes:
+                                    status_label = "empty"
+                                    stats["empty_routes"] += 1
+                                    vehicle_stats[v_id]["empty"] += 1
+                                else:
+                                    status_label = "normal"
+                                    stats["success_pairs"] += 1
+                                    vehicle_stats[v_id]["normal"] += 1
+                            
+                            save_to_file(rid, req_data, "req", v_id, status_label)
+                            save_to_file(rid, rsp_data, "rsp", v_id, status_label)
                         else:
                             stats["ignored_by_filter"] += 1
-                            vehicle_stats[vehicle_id]["ignored_by_filter"] += 1
+                            vehicle_stats[v_id]["filtered"] += 1
                             
                     except json.JSONDecodeError:
                         stats["failed_json"] += 1
-                        # 使用默认的 vehicle_id 记录失败情况
-                        vehicle_id = "unknown"
-                        vehicle_stats[vehicle_id]["failed_json"] += 1
+                        vehicle_stats[v_id]["failed_json"] += 1
                     
                     del pending_requests[rid]
 
+    # 处理只有请求没有响应的情况 (unmatched)
+    for rid, req_info in pending_requests.items():
+        v_id = req_info["v_id"]
+        d_type = req_info["d_type"]
+        p_type = req_info["p_type"]
+        
+        if d_type == 1 and p_type == 0:
+            vehicle_stats[v_id]["target_req"] += 1
+            vehicle_stats[v_id]["unmatched"] += 1
+            try:
+                req_data = json.loads(req_info["content"])
+                save_to_file(rid, req_data, "req", v_id, "unmatched")
+            except:
+                pass
+        else:
+            # 非目标请求的丢失，通常不关心，但也计入 filtered
+            vehicle_stats[v_id]["filtered"] += 1
+
     print_report(stats, combination_counts, len(pending_requests), vehicle_stats)
 
-def save_to_file(rid, data, suffix, vehicle_id):
-    # 为每个vehicle_id创建子文件夹
-    vehicle_dir = os.path.join(output_dir, str(vehicle_id))
-    if not os.path.exists(vehicle_dir):
-        os.makedirs(vehicle_dir)
+def save_to_file(rid, data, suffix, vehicle_id, status_label):
+    # 路径结构: output_dir/vehicle_id/status_label/rid_suffix.json
+    target_dir = os.path.join(output_dir, str(vehicle_id), status_label)
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
     
     filename = f"{rid}_{suffix}.json"
-    path = os.path.join(vehicle_dir, filename)
+    path = os.path.join(target_dir, filename)
     with open(path, "w", encoding="utf-8") as jf:
         json.dump(data, jf, indent=4, ensure_ascii=False)
 
-def print_report(stats, combination_counts, unmatched, vehicle_stats):
+def print_report(stats, combination_counts, unmatched_total, vehicle_stats):
     total = stats["total_req_found"]
-    print("\n" + "="*55)
-    print(f"        调度业务分析报告 ({os.path.basename(log_file_path)})")
-    print("="*55)
+    print("\n" + "="*85)
+    print(f"          调度业务分析报告 ({os.path.basename(log_file_path)})")
+    print("="*85)
     
-    # 1. 全局流量统计
     print(f"1. 全局流量统计:")
-    print(f"   - 日志扫描到的总请求数: {total}")
-    print(f"   - 成功配对并保存 (1, 0) 组合: {stats['success_pairs']}")
-    print(f"   - 因类型不符被过滤 (非1,0): {stats['ignored_by_filter']}")
-    print(f"   - JSON解析失败: {stats['failed_json']}")
-    print(f"   - 只有请求没有响应 (丢包): {unmatched}")
+    print(f"   - 总扫描请求数: {total}")
+    print(f"   - [Normal]    成功配对且有路径 (1,0): {stats['success_pairs']}")
+    print(f"   - [Empty]     成功配对但路径为空 (1,0): {stats['empty_routes']}")
+    print(f"   - [Error]     算法内部报错 (1,0): {stats['algorithm_error']}")
+    print(f"   - [Unmatched] 有请求无响应 (丢失): {unmatched_total}")
+    print(f"   - [Filtered]  非目标决策类型 (非1,0): {stats['ignored_by_filter']}")
+    print(f"   - [Fail]      JSON解析失败: {stats['failed_json']}")
     
-    # 2. 字段组合占比
-    print(f"\n2. 字段组合占比 (Decision_Type, Plan_Type):")
+    print(f"\n2. (Decision, Plan) 组合分布:")
     paired_total = sum(combination_counts.values())
     if paired_total > 0:
         for (d, p), count in sorted(combination_counts.items(), key=lambda x: x[1], reverse=True):
             percentage = (count / paired_total) * 100
-            # 这里的 d 和 p 如果没搜到会显示 None
             label = f"({d}, {p})"
             mark = " [Target]" if d == 1 and p == 0 else ""
             print(f"   - {label:<15}: {count:>4} 次 ({percentage:>6.2f}%){mark}")
     
-    # 3. 各车辆统计信息
-    print(f"\n3. 各车辆统计信息:")
-    print(f"   {'车辆ID':<15} {'总请求数':<10} {'成功配对':<10} {'被过滤':<10} {'解析失败':<10} {'成功率':<8}")
-    print(f"   {'-'*15} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
+    print(f"\n3. 车辆明细统计:")
+    # 表头增加 Target 和 Filtered 列
+    header = f"{'车辆ID':<12} {'总请求':>6} | {'目标(1,0)':>9} {'Normal':>7} {'Empty':>6} {'Error':>6} {'丢失':>5} | {'过滤':>5}"
+    print(f"   {header}")
+    print(f"   {'-'*82}")
     
-    # 按车辆ID排序
-    for vehicle_id in sorted(vehicle_stats.keys()):
-        v_stats = vehicle_stats[vehicle_id]
-        v_total = v_stats["total_req_found"]
-        v_success = v_stats["success_pairs"]
-        v_ignored = v_stats["ignored_by_filter"]
-        v_failed = v_stats["failed_json"]
-        
-        v_success_rate = (v_success / v_total * 100) if v_total > 0 else 0
-        print(f"   {vehicle_id:<15} {v_total:<10} {v_success:<10} {v_ignored:<10} {v_failed:<10} {v_success_rate:>7.2f}%")
+    for v_id in sorted(vehicle_stats.keys()):
+        v = vehicle_stats[v_id]
+        row = f"{v_id:<12} {v['total_req']:>6} | {v['target_req']:>9} {v['normal']:>7} {v['empty']:>6} {v['error']:>6} {v['unmatched']:>5} | {v['filtered']:>5}"
+        print(f"   {row}")
     
-    # 4. 最终目标数据提取率
-    success_rate = (stats["success_pairs"] / total * 100) if total > 0 else 0
-    print("\n" + "-" * 55)
-    print(f"最终目标数据 (1,0) 提取率: {success_rate:.2f}%")
-    print("="*55)
+    target_total = sum(v["target_req"] for v in vehicle_stats.values())
+    success_rate = (stats["success_pairs"] / target_total * 100) if target_total > 0 else 0
+    print("\n" + "-" * 85)
+    print(f"目标业务 (1,0) 完结率 (Normal/Target): {success_rate:.2f}%")
+    print("="*85)
 
 if __name__ == "__main__":
     extract_logs()

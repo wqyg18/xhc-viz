@@ -30,17 +30,31 @@ def send_request(input_data, api_url):
 
 # 获取所有的rid
 def get_all_rids(input_dir):
-    rids = set()
-    # 递归遍历目录结构，处理按车辆ID分类的文件
+    rids = []
+    # 递归遍历目录结构，处理按 车辆ID/状态 分类的文件
+    # 结构: input_dir / {vehicle_id} / {status} / {rid}_req.json
     for root, dirs, files in os.walk(input_dir):
         for filename in files:
             if filename.endswith("_req.json"):
                 rid = filename[:-9]  # 移除 "_req.json"
-                rids.add((rid, root))
-    return sorted(rids, key=lambda x: x[0])
+                # 从路径中提取 status 和 vehicle_id
+                # root 可能是 .../mylog_input/log_name/vehicle_id/status
+                parts = os.path.normpath(root).split(os.sep)
+                if len(parts) >= 2:
+                    status = parts[-1]
+                    vehicle_id = parts[-2]
+                    rids.append({
+                        "rid": rid,
+                        "sub_dir": root,
+                        "status": status,
+                        "vehicle_id": vehicle_id
+                    })
+    return sorted(rids, key=lambda x: x["rid"])
 
 # 处理单个请求
-def process_one_request(rid, sub_dir, log_new_rsp_dir, api_url):
+def process_one_request(item, log_new_rsp_dir, api_url):
+    rid = item["rid"]
+    sub_dir = item["sub_dir"]
     req_file = os.path.join(sub_dir, f"{rid}_req.json")
     if not os.path.exists(req_file):
         return False
@@ -52,9 +66,8 @@ def process_one_request(rid, sub_dir, log_new_rsp_dir, api_url):
     new_rsp = send_request(req_data, api_url)
     
     if new_rsp:
-        # 保持 vehicle_id 层级
-        vehicle_id = os.path.basename(sub_dir)
-        target_dir = os.path.join(log_new_rsp_dir, vehicle_id)
+        # 保持 vehicle_id 和 status 层级
+        target_dir = os.path.join(log_new_rsp_dir, item["vehicle_id"], item["status"])
         ensure_dir(target_dir)
         
         new_rsp_file = os.path.join(target_dir, f"{rid}_new_rsp.json")
@@ -69,15 +82,15 @@ def request_all(input_dir, output_dir, api_url, max_count):
     log_new_rsp_dir = os.path.join(output_dir, log_name)
     ensure_dir(log_new_rsp_dir)
     
-    all_rids = get_all_rids(input_dir)
-    rids_to_process = all_rids[:max_count]
+    all_items = get_all_rids(input_dir)
+    items_to_process = all_items[:max_count]
     
-    print(f"开始请求 API，日志: {log_name}, 数量: {len(rids_to_process)}")
+    print(f"开始请求 API，日志: {log_name}, 数量: {len(items_to_process)}")
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [
-            executor.submit(process_one_request, rid, sub_dir, log_new_rsp_dir, api_url)
-            for rid, sub_dir in rids_to_process
+            executor.submit(process_one_request, item, log_new_rsp_dir, api_url)
+            for item in items_to_process
         ]
     
     results = [future.result() for future in futures]
@@ -89,61 +102,75 @@ def visualize_original(input_dir, viz_dir, max_count):
     log_viz_dir = os.path.join(viz_dir, log_name)
     ensure_dir(log_viz_dir)
     
-    all_rids = get_all_rids(input_dir)
-    rids_to_visualize = all_rids[:max_count]
+    all_items = get_all_rids(input_dir)
+    items_to_visualize = all_items[:max_count]
     
     print(f"正在生成原始可视化，日志: {log_name}")
     
-    for rid, sub_dir in rids_to_visualize:
-        vehicle_id = os.path.basename(sub_dir)
-        vehicle_viz_dir = os.path.join(log_viz_dir, vehicle_id)
-        ensure_dir(vehicle_viz_dir)
+    for item in items_to_visualize:
+        rid = item["rid"]
+        sub_dir = item["sub_dir"]
+        status = item["status"]
+        vehicle_id = item["vehicle_id"]
+        
+        # 保持目录层级: viz_dir/log_name/vehicle_id/status/
+        vehicle_status_viz_dir = os.path.join(log_viz_dir, vehicle_id, status)
+        ensure_dir(vehicle_status_viz_dir)
         
         req_file = os.path.join(sub_dir, f"{rid}_req.json")
         rsp_file = os.path.join(sub_dir, f"{rid}_rsp.json")
         
-        if not os.path.exists(req_file) or not os.path.exists(rsp_file):
+        if not os.path.exists(req_file):
             continue
 
-        # 可视化输入
-        create_visualization(req_file, os.path.join(vehicle_viz_dir, f"{rid}_input.html"))
+        # 可视化输入 (所有状态都有输入)
+        create_visualization(req_file, os.path.join(vehicle_status_viz_dir, f"{rid}_input.html"))
         
-        # 处理输出响应格式
-        with open(rsp_file, "r", encoding="utf-8") as f:
-            rsp_data = json.load(f)
-        
-        output_html = os.path.join(vehicle_viz_dir, f"{rid}_output.html")
-        if "data" not in rsp_data:
-            temp_rsp = os.path.join(vehicle_viz_dir, f"temp_{rid}.json")
-            with open(temp_rsp, "w", encoding="utf-8") as f:
-                json.dump({"data": rsp_data}, f)
-            create_output_visualization(req_file, temp_rsp, output_html)
-            os.remove(temp_rsp)
-        else:
-            create_output_visualization(req_file, rsp_file, output_html)
+        # 只有 normal, empty, error 状态可能存在原始响应
+        if status in ["normal", "empty", "error"] and os.path.exists(rsp_file):
+            # 处理输出响应格式
+            with open(rsp_file, "r", encoding="utf-8") as f:
+                try:
+                    rsp_data = json.load(f)
+                except:
+                    continue
+            
+            output_html = os.path.join(vehicle_status_viz_dir, f"{rid}_output.html")
+            if "data" not in rsp_data:
+                temp_rsp = os.path.join(vehicle_status_viz_dir, f"temp_{rid}.json")
+                with open(temp_rsp, "w", encoding="utf-8") as f:
+                    json.dump({"data": rsp_data}, f)
+                create_output_visualization(req_file, temp_rsp, output_html)
+                os.remove(temp_rsp)
+            else:
+                create_output_visualization(req_file, rsp_file, output_html)
 
 # 3. 可视化新旧对比
-def visualize_compare_one(rid, sub_dir, log_new_rsp_base, log_viz_base):
-    vehicle_id = os.path.basename(sub_dir)
-    vehicle_viz_dir = os.path.join(log_viz_base, vehicle_id)
-    ensure_dir(vehicle_viz_dir)
+def visualize_compare_one(item, log_new_rsp_base, log_viz_base):
+    rid = item["rid"]
+    sub_dir = item["sub_dir"]
+    status = item["status"]
+    vehicle_id = item["vehicle_id"]
+    
+    vehicle_status_viz_dir = os.path.join(log_viz_base, vehicle_id, status)
+    ensure_dir(vehicle_status_viz_dir)
     
     req_file = os.path.join(sub_dir, f"{rid}_req.json")
     orig_rsp_file = os.path.join(sub_dir, f"{rid}_rsp.json")
-    # 这里的 new_rsp_file 路径也要对应上新的 vehicle_id 层级
-    new_rsp_file = os.path.join(log_new_rsp_base, vehicle_id, f"{rid}_new_rsp.json")
+    # 这里的 new_rsp_file 路径也要对应上新的 vehicle_id/status 层级
+    new_rsp_file = os.path.join(log_new_rsp_base, vehicle_id, status, f"{rid}_new_rsp.json")
     
     if not all(os.path.exists(f) for f in [req_file, orig_rsp_file, new_rsp_file]):
         return False
 
     # 生成 Original 和 New 的 HTML
     for suffix, rsp_f in [("original", orig_rsp_file), ("new", new_rsp_file)]:
-        out_html = os.path.join(vehicle_viz_dir, f"{rid}_{suffix}_output.html")
+        out_html = os.path.join(vehicle_status_viz_dir, f"{rid}_{suffix}_output.html")
         with open(rsp_f, "r", encoding="utf-8") as f:
             data = json.load(f)
         
         if "data" not in data:
-            temp = os.path.join(vehicle_viz_dir, f"temp_{rid}_{suffix}.json")
+            temp = os.path.join(vehicle_status_viz_dir, f"temp_{rid}_{suffix}.json")
             with open(temp, "w", encoding="utf-8") as f:
                 json.dump({"data": data}, f)
             create_output_visualization(req_file, temp, out_html)
@@ -157,15 +184,15 @@ def visualize_compare_all(input_dir, new_output_dir, viz_dir, max_count):
     log_viz_base = os.path.join(viz_dir, log_name)
     log_new_rsp_base = os.path.join(new_output_dir, log_name)
     
-    all_rids = get_all_rids(input_dir)
-    rids_to_viz = all_rids[:max_count]
+    all_items = get_all_rids(input_dir)
+    items_to_viz = all_items[:max_count]
     
     print(f"正在生成对比可视化，日志: {log_name}")
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [
-            executor.submit(visualize_compare_one, rid, sub_dir, log_new_rsp_base, log_viz_base)
-            for rid, sub_dir in rids_to_viz
+            executor.submit(visualize_compare_one, item, log_new_rsp_base, log_viz_base)
+            for item in items_to_viz
         ]
     
     success = sum([f.result() for f in futures])
