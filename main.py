@@ -201,6 +201,7 @@ def create_output_visualization(
         "为优化总成本而被放弃 (惩罚项生效)": "#dc3545",
         "预剪枝: 需求为零的站点": "#fd7e14",
         "预剪枝: 未启用储车区": "#6f42c1",
+        "引擎内部删除 / 未返回": "#000000",
         "other": "#6c757d",
     }
     unassigned_layers = {
@@ -221,6 +222,28 @@ def create_output_visualization(
 
     # 3. 准备数据映射
     station_map = {s["station_id"]: s for s in req_data["stations"]}
+
+    # --- 数据补全：找出被引擎内部删除或未返回的站点 ---
+    handled_sids = set()
+    # 统计已指派的
+    for route in response_data.get("data", {}).get("routes", []):
+        for stop in route.get("stops", []):
+            handled_sids.add(stop["location_id"])
+    # 统计已在未指派列表中的
+    for un in response_data.get("data", {}).get("unassigned_tasks", []):
+        handled_sids.add(un["location_id"])
+
+    # 找出缺失的站点并补回
+    missing_reason = "引擎内部删除 / 未返回"
+    for sid in station_map:
+        if sid not in handled_sids:
+            if "unassigned_tasks" not in response_data["data"]:
+                response_data["data"]["unassigned_tasks"] = []
+            response_data["data"]["unassigned_tasks"].append(
+                {"location_id": sid, "reason": missing_reason}
+            )
+    # ----------------------------------------------
+
     route_coords = [vehicle_wgs]
 
     # 4. 绘制已指派站点
